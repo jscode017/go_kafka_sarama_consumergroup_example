@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"github.com/Shopify/sarama"
 	"log"
 	"os"
@@ -14,12 +15,19 @@ import (
 type ConsumerGroupHandle struct {
 }
 
-func AddNewConsumerAndConsume(ctx context.Context, client sarama.Client, wg *sync.WaitGroup, newlyAdd bool) {
+func AddNewConsumerAndConsume(ctx context.Context, config *sarama.Config, wg *sync.WaitGroup, newlyAdd bool, brokerAddrs []string) {
+	client, err := sarama.NewClient(brokerAddrs, config)
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close() //ignore error
+
 	consumerGroup, err := sarama.NewConsumerGroupFromClient("ex_group", client)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer consumerGroup.Close() //ignore error
+
 	if !newlyAdd {
 		wg.Done()
 		wg.Wait()
@@ -27,6 +35,18 @@ func AddNewConsumerAndConsume(ctx context.Context, client sarama.Client, wg *syn
 	//TODO: seems this is not enough, cause the rebalance only happen when you call Consume(), so still can not show that the rebalance is finish
 	consumerGroupHandle := ConsumerGroupHandle{}
 	log.Println("start consuming")
+	go func() {
+		for {
+			select {
+			case err, ok := <-consumerGroup.Errors():
+				if !ok {
+					return
+				}
+				log.Println(err)
+				continue
+			}
+		}
+	}()
 	for {
 
 		err := consumerGroup.Consume(ctx, []string{"demo_topic"}, &consumerGroupHandle)
@@ -43,26 +63,20 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, os.Kill, syscall.SIGTERM)
 
-	brokersAddrs := []string{"localhost:9092"}
+	brokerAddrs := []string{"localhost:9092"}
 	config := sarama.NewConfig()
-	config.Consumer.Return.Errors = true
+	config.Consumer.Group.Rebalance.Strategy = sarama.BalanceStrategySticky
 	version, err := sarama.ParseKafkaVersion("2.4.0")
 	if err != nil {
 		log.Panicf("Error parsing Kafka version: %v", err)
 	}
 	config.Version = version
 
-	client, err := sarama.NewClient(brokersAddrs, config)
-	defer client.Close() //ignore error
-	if err != nil {
-		panic(err)
-	}
-
 	ctx, _ := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go AddNewConsumerAndConsume(ctx, client, &wg, false)
-	go AddNewConsumerAndConsume(ctx, client, &wg, false)
+	go AddNewConsumerAndConsume(ctx, config, &wg, false, brokerAddrs)
+	go AddNewConsumerAndConsume(ctx, config, &wg, false, brokerAddrs)
 
 	addOneConsumerCh := make(chan bool, 1)
 	go func(addOne chan bool) {
@@ -80,7 +94,7 @@ func main() {
 		case <-signals:
 			return
 		case <-addOneConsumerCh:
-			go AddNewConsumerAndConsume(ctx, client, &wg, true)
+			go AddNewConsumerAndConsume(ctx, config, &wg, true, brokerAddrs)
 		}
 	}
 }
@@ -100,6 +114,7 @@ func (handle *ConsumerGroupHandle) ConsumeClaim(session sarama.ConsumerGroupSess
 		if !ok {
 			continue
 		}
+		fmt.Printf("%+v\n", session)
 		log.Println("message claimed: value: ", string(msg.Value), "topic: ", msg.Topic, "Partition: ", msg.Partition, "offset: ", msg.Offset)
 		session.MarkMessage(msg, "")
 	}
